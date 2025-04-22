@@ -11,6 +11,17 @@ high_res_frame = None
 low_res_frame = None
 detections = []
 
+def picam2_init():
+    """
+    Picamera2 초기화 및 설정
+    :return: Picamera2 객체
+    """
+    picam2 = Picamera2()
+    preview_config = picam2.create_preview_configuration(main={"size": HIGH_RES})
+    picam2.configure(preview_config)
+    picam2.start()
+    return picam2
+
 def capture_thread(picam2):
     """
     카메라에서 프레임을 캡처하여 원본 프레임은 high_res_frame에,
