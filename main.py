@@ -15,9 +15,9 @@ picam2 = picam2_init()
 
 # 스레드 시작
 threads = [
-    threading.Thread(target=capture_thread(picam2= picam2), daemon=True),
-    threading.Thread(target=detect_thread(model=model), daemon=True),
-    threading.Thread(target=display_thread(picam2=picam2), daemon=False)
+    threading.Thread(target=capture_thread, args=(picam2,), daemon=True),
+    threading.Thread(target=detect_thread, args=(model,), daemon=True),
+    threading.Thread(target=display_thread, args=(picam2,), daemon=False)
 ]
 
 for t in threads:
