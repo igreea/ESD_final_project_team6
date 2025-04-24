@@ -14,10 +14,14 @@ detections = []
 def picam2_init():
     """
     Picamera2 초기화 및 설정
+    high-resolution(main)과 low-resolution(lores) 두 이미지 동시 캡쳐 
     :return: Picamera2 객체
     """
     picam2 = Picamera2()
-    preview_config = picam2.create_preview_configuration(main={"size": HIGH_RES})
+    preview_config = picam2.create_preview_configuration(
+        main={"size": HIGH_RES},
+        lores={"size": LOW_RES}
+        )
     picam2.configure(preview_config)
     picam2.start()
     return picam2
@@ -30,9 +34,8 @@ def capture_thread(picam2):
     """
     global high_res_frame, low_res_frame
     while True:
-        frame = picam2.capture_array()
-        high_res_frame = frame
-        low_res_frame = cv2.resize(frame, LOW_RES, interpolation=cv2.INTER_AREA)
+        high_res_frame = picam2.capture_array("main")
+        low_res_frame = picam2.capture_array("lores")
 
 def detect_thread(model):
     """
