@@ -4,7 +4,7 @@ import torch
 from picamera2 import Picamera2
 import numpy as np
 from ultralytics import YOLO
-from util import capture_thread, detect_thread, display_thread, picam2_init
+from util import capture_thread, detect_thread, display_thread, picam2_init, stop_event
 
 # 모델 로드 및 설정
 model = YOLO("yolo11n.pt")

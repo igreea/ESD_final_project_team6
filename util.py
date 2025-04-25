@@ -1,15 +1,22 @@
 from picamera2 import Picamera2
 import cv2
 import numpy as np
+import threading
+from queue import Queue, Empty
 
 # 해상도 설정
 HIGH_RES = (1280, 720)
 LOW_RES = (480, 270)
 
 # 전역 프레임 버퍼
-high_res_frame = None
-low_res_frame = None
-detections = []
+#high_res_frame = None
+#low_res_frame = None
+#detections = []
+hi_queue = Queue(maxsize=1)
+lo_queue = Queue(maxsize=1)
+det_queue = Queue(maxsize=1)
+
+stop_event = threading.Event()
 
 def picam2_init():
     """
@@ -28,67 +35,87 @@ def picam2_init():
 
 def capture_thread(picam2):
     """
-    카메라에서 프레임을 캡처하여 원본 프레임은 high_res_frame에,
-    저해상도 프레임은 low_res_frame에 저장
+    카메라에서 프레임을 캡처하여 원본 프레임은 hi_queue에,
+    저해상도 프레임은 lo_queue에 저장
     :param picam2: Picamera2 객체
     """
-    global high_res_frame, low_res_frame
-    while True:
-        high_res_frame = picam2.capture_array("main")
-        low_res_frame = picam2.capture_array("lores")
+    global hi_queue, lo_queue, stop_event
+    while not stop_event.is_set():
+        hi = picam2.capture_array("main")
+        lo = picam2.capture_array("lores")
+        # 이전 프레임 버리기
+        if hi_queue.full():
+            hi_queue.get_nowait()
+        if lo_queue.full():
+            lo_queue.get_nowait()
+        hi_queue.put(hi)
+        lo_queue.put(lo)
 
 def detect_thread(model):
     """
-    low_res_frame에서 YOLO 모델을 사용하여 사람 감지
+    lo_queue에서 YOLO 모델을 사용하여 사람 감지
     xyxy는 yolo에서 제공하는 attribute로, [x1, y1, x2, y2, conf, cls]를 포함
     :param model: YOLO 모델 객체
     """
-    global low_res_frame, detections
-    while True:
-        if low_res_frame is None:
+    global lo_queue, det_queue, stop_event
+    while not stop_event.is_set():
+        try:
+            frame = lo_queue.get(timeout=0.1)
+        except Empty:
             continue
-        results = model(low_res_frame)
-        detections = results.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2, conf, cls]
+        results = model.predict(source=frame, stream=True)
+        dets = results.boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
+        if det_queue.full():
+            det_queue.get_nowait()
+        det_queue.put(dets)
 
 def display_thread(picam2):
     """
     고해상도 프레임과 저해상도 프레임을 각기 다른 창에 표시
     :param picam2: Picamera2 객체
     """
-    global high_res_frame, low_res_frame, detections
+    global hi_queue, lo_queue, det_queue, stop_event
     win_low = "Low-Res Stream"
     win_roi = "High-Res ROI Detection"
+    #win_roi2 = "High-Res ROI Detection 2"
     cv2.namedWindow(win_low, cv2.WINDOW_AUTOSIZE)
 
-    while True:
-        if low_res_frame is not None:
-            cv2.imshow(win_low, low_res_frame)
+    while not stop_event.is_set():
+        try:
+            hi = hi_queue.get(timeout=0.1)
+            lo = lo_queue.get()
+            dets = det_queue.get()
+        except Empty:
+            continue
+            
+        cv2.imshow(win_low, lo)
 
-        # 사람 감지 시에만 고해상도 창 표시
-        if high_res_frame is not None and len(detections) > 0:
-            # Limit ROI count
-            dets_to_show = detections[:2] if len(detections) >= 3 else detections
-
-            roi_patches = []
-            scale_x = HIGH_RES[0] / LOW_RES[0]
-            scale_y = HIGH_RES[1] / LOW_RES[1]
-            for *box, conf, cls in dets_to_show:
-                x1, y1, x2, y2 = map(int, box)
-                hr_x1, hr_y1 = int(x1 * scale_x), int(y1 * scale_y)
-                hr_x2, hr_y2 = int(x2 * scale_x), int(y2 * scale_y)
-                roi = high_res_frame[hr_y1:hr_y2, hr_x1:hr_x2]
+        if dets:
+            dets_to_show = dets[:2] if len(dets) >= 3 else dets
+            patches = []
+            sx = HIGH_RES[0] / LOW_RES[0]
+            sy = HIGH_RES[1] / LOW_RES[1]
+            for x1, y1, x2, y2 in dets_to_show:   
+                x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+                hr1, hr2 = int(x1*sx), int(y1*sy)
+                hr3, hr4 = int(x2*sx), int(y2*sy)
+                roi = hi[hr2:hr4, hr1:hr3]
                 if roi.size:
-                    roi_patches.append(roi)
-
-            # Show only if any ROI patches exist
-            if roi_patches:
-                display_roi = np.vstack(roi_patches)
-                cv2.imshow(win_roi, display_roi)
+                    patches.append(roi)
+            if len(patches) > 1:
+                h1, w1 = patches[0].shape[:2]
+                h2, w2 = patches[1].shape[:2]
+                canvas = np.zeros((max(h1, h2), w1 + w2, 3), dtype=patches[0].dtype)
+                canvas[:h1, :w1] = patches[0]
+                canvas[:h2, w1:w1+w2] = patches[1]
+                cv2.imshow(win_roi, canvas)
+            else:
+                cv2.imshow(win_roi, patches[0])
         else:
-            # Close the ROI window if no detection
             cv2.destroyWindow(win_roi)
-
+        
         if cv2.waitKey(1) & 0xFF == ord('q'):
+            stop_event.set()
             break
 
     picam2.stop()
