@@ -10,18 +10,8 @@ LOW_RES = (480, 270)
 high_res_frame = None
 low_res_frame = None
 detections = []
-
-def picam2_init():
-    """
-    Picamera2 초기화 및 설정
-    :return: Picamera2 객체
-    """
-    picam2 = Picamera2()
-    preview_config = picam2.create_preview_configuration(main={"size": HIGH_RES})
-    picam2.configure(preview_config)
-    picam2.start()
-    return picam2
-
+results = []
+'''
 def capture_thread(picam2):
     """
     카메라에서 프레임을 캡처하여 원본 프레임은 high_res_frame에,
@@ -33,6 +23,21 @@ def capture_thread(picam2):
         frame = picam2.capture_array()
         high_res_frame = frame
         low_res_frame = cv2.resize(frame, LOW_RES, interpolation=cv2.INTER_AREA)
+'''
+
+def capture_thread_webcam(webcam):
+    """
+    카메라에서 프레임을 캡처하여 원본 프레임은 high_res_frame에,
+    저해상도 프레임은 low_res_frame에 저장
+    :param picam2: Picamera2 객체
+    """
+    global high_res_frame, low_res_frame
+    while True:
+        ret, frame_high = webcam.read()
+        high_res_frame = frame_high
+        low_res_frame = cv2.resize(high_res_frame, LOW_RES, interpolation=cv2.INTER_AREA)
+# inter area??? linear???
+
 
 def detect_thread(model):
     """
@@ -40,14 +45,18 @@ def detect_thread(model):
     xyxy는 yolo에서 제공하는 attribute로, [x1, y1, x2, y2, conf, cls]를 포함
     :param model: YOLO 모델 객체
     """
-    global low_res_frame, detections
+    global low_res_frame, results, detections
     while True:
         if low_res_frame is None:
             continue
-        results = model(low_res_frame)
-        detections = results.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2, conf, cls]
+        # results = model(low_res_frame)
+        #results = model(low_res_frame, classes=[0], conf=0.4)
+        results = model.predict(source=low_res_frame, classes=[0], conf=0.4)
+        print(results)
+        detections = results[0].boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2, conf, cls]
 
-def display_thread(picam2):
+
+def display_thread(webcam):
     """
     고해상도 프레임과 저해상도 프레임을 각기 다른 창에 표시
     :param picam2: Picamera2 객체
@@ -55,6 +64,7 @@ def display_thread(picam2):
     global high_res_frame, low_res_frame, detections
     win_low = "Low-Res Stream"
     win_roi = "High-Res ROI Detection"
+    win_roi2 = "High-Res ROI Detection 2"
     cv2.namedWindow(win_low, cv2.WINDOW_AUTOSIZE)
 
     while True:
@@ -69,7 +79,7 @@ def display_thread(picam2):
             roi_patches = []
             scale_x = HIGH_RES[0] / LOW_RES[0]
             scale_y = HIGH_RES[1] / LOW_RES[1]
-            for *box, conf, cls in dets_to_show:
+            for box in dets_to_show:
                 x1, y1, x2, y2 = map(int, box)
                 hr_x1, hr_y1 = int(x1 * scale_x), int(y1 * scale_y)
                 hr_x2, hr_y2 = int(x2 * scale_x), int(y2 * scale_y)
@@ -78,15 +88,70 @@ def display_thread(picam2):
                     roi_patches.append(roi)
 
             # Show only if any ROI patches exist
-            if roi_patches:
-                display_roi = np.vstack(roi_patches)
-                cv2.imshow(win_roi, display_roi)
+            if len(roi_patches) == 2:
+                cv2.imshow(win_roi2, roi_patches[1])
+                #display_roi = np.vstack(roi_patches)
+                cv2.imshow(win_roi, roi_patches[0])
+            else:
+                cv2.imshow(win_roi,roi_patches[0])
         else:
-            # Close the ROI window if no detection
-            cv2.destroyWindow(win_roi)
+            # Close the ROI window if no detection 
+            try:
+                cv2.destroyWindow(win_roi)
+            except cv2.error:
+                pass  # 창이 없으면 그냥 무시
+
+            #--> win_roi가 없으면 오류
+            # if cv2.getWindowProperty(win_roi, cv2.WND_PROP_VISIBLE) >= 0:   
+            #   cv2.destroyWindow(win_roi)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    picam2.stop()
+    # picam2.stop()
+    webcam.release()
     cv2.destroyAllWindows()
+
+
+'''
+def display_thread(webcam):
+    """
+    고해상도 프레임과 저해상도 프레임을 각기 다른 창에 표시
+    :param picam2: Picamera2 객체
+    """
+    global high_res_frame, low_res_frame, detections, results
+    win_low = "Low-Res Stream"
+    win_roi = "High-Res ROI Detection"
+    cv2.namedWindow(win_low, cv2.WINDOW_AUTOSIZE)
+
+    while True:
+        if low_res_frame is not None:
+            cv2.imshow(win_low, low_res_frame)
+
+        # 사람 감지 시에만 고해상도 창 표시
+        if len(results)>0:
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+                # 비율 변환: 저화질 → 고화질 (1:2)
+                x1_hd, y1_hd, x2_hd, y2_hd = x1*2, y1*2, x2*2, y2*2
+
+                # ROI 잘라내기
+                roi_hd = high_res_frame[y1_hd:y2_hd, x1_hd:x2_hd]
+
+                # ROI가 유효할 때만 창 띄우기
+                if roi_hd.size > 0:
+                    cv2.imshow("Detected Person ROI (HD)", roi_hd)
+                break  # 첫 번째 사람만 처리 (여러 명 처리하려면 이 부분 제거)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # picam2.stop()
+    webcam.release()
+    cv2.destroyAllWindows()
+
+
+'''
+
+
