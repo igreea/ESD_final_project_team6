@@ -6,7 +6,8 @@ from queue import Queue, Empty
 
 # 해상도 설정
 HIGH_RES = (1280, 720)
-LOW_RES = (480, 270)
+LOW_RES = (320, 180)
+LOW_RES_T = (LOW_RES[1], LOW_RES[0])
 
 # 전역 프레임 버퍼
 #high_res_frame = None
@@ -26,7 +27,7 @@ def picam2_init():
     """
     picam2 = Picamera2()
     preview_config = picam2.create_preview_configuration(
-        main={"size": HIGH_RES},
+        main={"size": HIGH_RES, "format": "RGB888"},
         lores={"size": LOW_RES}
         )
     picam2.configure(preview_config)
@@ -61,9 +62,10 @@ def detect_thread(model):
     while not stop_event.is_set():
         try:
             frame = lo_queue.get(timeout=0.1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
         except Empty:
             continue
-        results = model.predict(source=frame, stream=True)
+        results = model(rgb, imgsz=LOW_RES_T, rect=True)[0]
         dets = results.boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
         if det_queue.full():
             det_queue.get_nowait()
@@ -90,7 +92,7 @@ def display_thread(picam2):
             
         cv2.imshow(win_low, lo)
 
-        if dets:
+        if len(dets):
             dets_to_show = dets[:2] if len(dets) >= 3 else dets
             patches = []
             sx = HIGH_RES[0] / LOW_RES[0]
