@@ -5,8 +5,8 @@ import threading
 from queue import Queue, Empty
 
 # 해상도 설정
-HIGH_RES = (1280, 720)
-LOW_RES = (320, 180)
+HIGH_RES = (1280, 1280)
+LOW_RES = (192, 192)
 LOW_RES_T = (LOW_RES[1], LOW_RES[0])
 
 # 전역 프레임 버퍼
@@ -27,7 +27,7 @@ def picam2_init():
     """
     picam2 = Picamera2()
     preview_config = picam2.create_preview_configuration(
-        main={"size": HIGH_RES, "format": "RGB888"},
+        main={"size": HIGH_RES, "format": "BGR888"},
         lores={"size": LOW_RES}
         )
     picam2.configure(preview_config)
@@ -43,7 +43,7 @@ def capture_thread(picam2):
     global hi_queue, lo_queue, stop_event
     while not stop_event.is_set():
         hi = picam2.capture_array("main")
-        lo = picam2.capture_array("lores")
+        lo = cv2.cvtColor(picam2.capture_array("lores"), cv2.COLOR_YUV2BGR_I420)
         # 이전 프레임 버리기
         if hi_queue.full():
             hi_queue.get_nowait()
@@ -62,7 +62,7 @@ def detect_thread(model):
     while not stop_event.is_set():
         try:
             frame = lo_queue.get(timeout=0.1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
+            rgb = frame[..., ::-1]  # (H,W,C) -> BGR에서 RGB로 변환
         except Empty:
             continue
         results = model(rgb, imgsz=LOW_RES_T, rect=True)[0]
@@ -80,7 +80,8 @@ def display_thread(picam2):
     win_low = "Low-Res Stream"
     win_roi = "High-Res ROI Detection"
     #win_roi2 = "High-Res ROI Detection 2"
-    cv2.namedWindow(win_low, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(win_low, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_low, 640, 640) #640x640으로 크기 조정
 
     while not stop_event.is_set():
         try:
