@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import threading
 import onnxruntime as ort
+from onnxruntime.quantization import quantize_dynamic, QuantType
 from time import time
 from queue import Queue, Empty, Full
 from picamera2 import Picamera2
@@ -123,10 +124,8 @@ class CameraProcessor:
                     canvas[:h1, :w1] = patches[0]
                     canvas[:h2, w1:w1+w2] = patches[1]
                     cv2.imshow(win_hi, canvas)
-                elif len(patches) == 1:
-                    cv2.imshow(win_hi, patches[0])
                 else:
-                    cv2.imshow(win_hi, self.blank)
+                    cv2.imshow(win_hi, patches[0])
             else:
                 cv2.imshow(win_hi, self.blank)  # 빈 프레임 표시
                 #cv2.destroyWindow(win_hi)
@@ -150,15 +149,24 @@ class CameraProcessor:
     
 
 if __name__ == "__main__":
-    # try:
-    #     model = YOLO("yolo11n.onnx")
-    # except:
-    #     model = util.load_onnx_model("yolo11n.pt")
-        
+    HIGH_RES = (1280, 1280)  # 고해상도 해상도
+    LOW_RES = (192, 192)  # 저해상도 해상도
+    QUANT = True  # 양자화 여부
+
+    try:
+        onnx_model = YOLO("yolo11n.onnx", task="detect")
+    except:
+        onnx_model = util.load_onnx_model("yolo11n.pt", res=LOW_RES)
+
+    if QUANT:
+        onnx_model_quant = util.quant_onnx("yolo11n.onnx", "yolo11n_quant.onnx")
+    
+    # 환경변수 설정__ 필요하면 잡아주기
     # os.environ["OMP_NUM_THREADS"] = "4"  # Disable OpenMP threads for ONNX Runtime
     # os.environ["OPENBLAS_NUM_THREADS"] = "4"  # Disable OpenBLAS threads for ONNX Runtime
     # os.environ["TORCH_NUM_THREADS"] = "4"  # Disable PyTorch threads for ONNX Runtime
-    model = YOLO("yolo11n.pt")
-    camera_processor = CameraProcessor(model)
+    
+    #model = YOLO("yolo11n.pt")
+    camera_processor = CameraProcessor(onnx_model, high_res=HIGH_RES, low_res=LOW_RES, classes=[0])
     camera_processor.run()
 
