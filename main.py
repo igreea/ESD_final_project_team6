@@ -27,11 +27,13 @@ class CameraProcessor:
             lores={"size": low_res, "format": "YUV420"}
         )
         self.picam2.configure(self.cfg)
-
+        self.low_res = low_res
         self.frame_queue = Queue(maxsize=max_queue_size)
         self.det_queue = Queue(maxsize=max_queue_size) 
         self.stop_event = threading.Event()
 
+        self.fps = 20  # 최저 FPS 설정
+        self.delay = 1/self.fps
         self.sx = high_res[0] / low_res[0] # 저해상도에서 고해상도로 변환할 때 x축 비율
         self.sy = high_res[1] / low_res[1] # 저해상도에서 고해상도로 변환할 때 y축 비율
 
@@ -67,7 +69,7 @@ class CameraProcessor:
                 continue
             bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
             rgb = bgr[..., ::-1]  # BGR to RGB view
-            results = self.model(rgb)
+            results = self.model(rgb, imgsz=self.low_res)
             dets = results[0].boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
             try:
                 self.det_queue.get_nowait()
@@ -84,6 +86,7 @@ class CameraProcessor:
         최악의 경우 timeout 지연 10ms 발생 가능
         :return: None
         """
+        start_time = time()
         win_hi = "High-Res"
         win_lo = "Low-Res"
         cv2.namedWindow(win_hi, cv2.WINDOW_AUTOSIZE)
@@ -93,7 +96,7 @@ class CameraProcessor:
         while not self.stop_event.is_set():
             # Retrieve most recent detection results
             try:
-                dets = self.det_queue.get(timeout=0.005)
+                dets = self.det_queue.get(timeout=self.delay)
             except Empty:
                 dets = None
 
@@ -133,8 +136,8 @@ class CameraProcessor:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
                 break
-
-        cv2.destroyAllWindows()
+        fps = 1 / (time() - start_time)
+        print(f"FPS: {fps:.2f}")
 
     def run(self):
         threads = [
@@ -159,7 +162,10 @@ if __name__ == "__main__":
         onnx_model = util.load_onnx_model("yolo11n.pt", res=LOW_RES)
 
     if QUANT:
-        onnx_model_quant = util.quant_onnx("yolo11n.onnx", "yolo11n_quant.onnx")
+        try:
+            onnx_model = YOLO("yolo11n_quant.onnx", task="detect")
+        except:
+            onnx_model = util.quant_onnx("yolo11n.onnx", "yolo11n_quant.onnx")
     
     # 환경변수 설정__ 필요하면 잡아주기
     # os.environ["OMP_NUM_THREADS"] = "4"  # Disable OpenMP threads for ONNX Runtime
@@ -167,6 +173,10 @@ if __name__ == "__main__":
     # os.environ["TORCH_NUM_THREADS"] = "4"  # Disable PyTorch threads for ONNX Runtime
     
     #model = YOLO("yolo11n.pt")
-    camera_processor = CameraProcessor(onnx_model, high_res=HIGH_RES, low_res=LOW_RES, classes=[0])
+    camera_processor = CameraProcessor(
+        model=onnx_model, 
+        high_res=HIGH_RES, 
+        low_res=LOW_RES, 
+        classes=[0])
     camera_processor.run()
 
