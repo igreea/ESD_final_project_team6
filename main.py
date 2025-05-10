@@ -33,11 +33,12 @@ class CameraProcessor:
         self.stop_event = threading.Event()
 
         self.fps = 20  # 최저 FPS 설정
-        self.delay = 1/self.fps
+        self.delay = 1/self.fps # 0.05초 대기
         self.sx = high_res[0] / low_res[0] # 저해상도에서 고해상도로 변환할 때 x축 비율
         self.sy = high_res[1] / low_res[1] # 저해상도에서 고해상도로 변환할 때 y축 비율
 
         self.blank = np.zeros((640, 640, 3), dtype=np.uint8)  # 빈 프레임
+
 
     def _capture_loop(self) -> None:
         """
@@ -55,10 +56,11 @@ class CameraProcessor:
             self.frame_queue.put((low, high), block=False)
         self.picam2.stop()
     
+
     def _detect_loop(self) -> None:
         """
         lo_queue에서 프레임을 가져와 YOLO 모델로 감지하고,
-        감지된 결과를 det_queue에 저장하는 스레드 -> 이때 priority queue 사용하여 자동 정렬
+        감지된 결과를 det_queue에 저장하는 스레드
         최악의 경우 timeout 지연 5ms 발생 가능
         :return: None
         """
@@ -80,10 +82,10 @@ class CameraProcessor:
             except Full:
                 pass # 사실 없어도 되는데 안전장치
 
+
     def _display_loop(self) -> None:
         """
         고해상도 프레임과 저해상도 프레임을 각기 다른 창에 표시하는 스레드
-        최악의 경우 timeout 지연 10ms 발생 가능
         :return: None
         """
         start_time = time()
@@ -139,6 +141,7 @@ class CameraProcessor:
         fps = 1 / (time() - start_time)
         print(f"FPS: {fps:.2f}")
 
+
     def run(self):
         threads = [
             threading.Thread(target=self._capture_loop, daemon=True),
@@ -156,6 +159,11 @@ if __name__ == "__main__":
     LOW_RES = (192, 192)  # 저해상도 해상도
     QUANT = True  # 양자화 여부
 
+    # 환경변수 설정__ 필요하면 잡아주기
+    # os.environ["OMP_NUM_THREADS"] = "4"  # Disable OpenMP threads for ONNX Runtime
+    # os.environ["OPENBLAS_NUM_THREADS"] = "4"  # Disable OpenBLAS threads for ONNX Runtime
+    # os.environ["TORCH_NUM_THREADS"] = "4"  # Disable PyTorch threads for ONNX Runtime
+
     try:
         onnx_model = YOLO("yolo11n.onnx", task="detect")
     except:
@@ -167,12 +175,6 @@ if __name__ == "__main__":
         except:
             onnx_model = util.quant_onnx("yolo11n.onnx", "yolo11n_quant.onnx")
     
-    # 환경변수 설정__ 필요하면 잡아주기
-    # os.environ["OMP_NUM_THREADS"] = "4"  # Disable OpenMP threads for ONNX Runtime
-    # os.environ["OPENBLAS_NUM_THREADS"] = "4"  # Disable OpenBLAS threads for ONNX Runtime
-    # os.environ["TORCH_NUM_THREADS"] = "4"  # Disable PyTorch threads for ONNX Runtime
-    
-    #model = YOLO("yolo11n.pt")
     camera_processor = CameraProcessor(
         model=onnx_model, 
         high_res=HIGH_RES, 
