@@ -1,4 +1,4 @@
-High-Resolution ROI Capture by RasberryPi4 
+High-Resolution ROI Capture by RaspberryPi4 
 ===========================================
 > 2025-1 ESD Team 6
 > 
