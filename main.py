@@ -4,11 +4,12 @@ import numpy as np
 import threading
 import onnxruntime as ort
 from onnxruntime.quantization import quantize_dynamic, QuantType
-from time import time
+import time
 from queue import Queue, Empty, Full
 from picamera2 import Picamera2
 from ultralytics import YOLO
 import util
+from collections import deque
 
 class CameraProcessor:
     def __init__(
@@ -23,21 +24,25 @@ class CameraProcessor:
         self.model.classes = classes
         self.picam2 = Picamera2()
         self.cfg = self.picam2.create_preview_configuration(
-            main={"size": high_res, "format": "BGR888"},
-            lores={"size": low_res, "format": "YUV420"}
+            main={"size": high_res, "format": "BGR888"}
         )
         self.picam2.configure(self.cfg)
+        
+        self.flg_count = 0
+
         self.low_res = low_res
         self.frame_queue = Queue(maxsize=max_queue_size)
         self.det_queue = Queue(maxsize=max_queue_size) 
         self.stop_event = threading.Event()
 
+        self._inf_time = deque(maxlen=500)  # 최근 500개 프레임의 추론 시간 기록
+        self._disp_time = deque(maxlen=500)  # 최근 500개 프레임의 디스플레이 시간 기록
         self.fps = 20  # 최저 FPS 설정
         self.delay = 1/self.fps # 0.05초 대기
         self.sx = high_res[0] / low_res[0] # 저해상도에서 고해상도로 변환할 때 x축 비율
         self.sy = high_res[1] / low_res[1] # 저해상도에서 고해상도로 변환할 때 y축 비율
 
-        self.blank = np.zeros((640, 640, 3), dtype=np.uint8)  # 빈 프레임
+        self.blank = np.zeros((100, 100, 3), dtype=np.uint8)  # 빈 프레임
 
 
     def _capture_loop(self) -> None:
@@ -47,12 +52,14 @@ class CameraProcessor:
         """
         self.picam2.start()
         while not self.stop_event.is_set():
-            low = self.picam2.capture_array("lores")
             high = self.picam2.capture_array("main")
-            try:
-                self.frame_queue.get_nowait()
-            except Empty:
-                pass
+            low = cv2.resize(
+                src=high, 
+                dsize=self.low_res, 
+                interpolation=cv2.INTER_AREA
+            )
+            if self.frame_queue.full():
+                self.frame_queue.get_nowait()  # 큐가 가득 찼을 때 가장 오래된 프레임 제거
             self.frame_queue.put((low, high), block=False)
         self.picam2.stop()
     
@@ -64,14 +71,18 @@ class CameraProcessor:
         최악의 경우 timeout 지연 5ms 발생 가능
         :return: None
         """
+        inf_time = time.perf_counter()
         while not self.stop_event.is_set():
             try:
-                yuv, trash = self.frame_queue.get(timeout=0.005)
+                bgr, _ = self.frame_queue.get(timeout=0.005)
             except Empty:
                 continue
-            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
             rgb = bgr[..., ::-1]  # BGR to RGB view
             results = self.model(rgb, imgsz=self.low_res)
+            inf_end_time = time.perf_counter()
+            self._inf_time.append(inf_end_time - inf_time) # inference time record
+            inf_time = inf_end_time
+
             dets = results[0].boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
             try:
                 self.det_queue.get_nowait()
@@ -81,34 +92,41 @@ class CameraProcessor:
                 self.det_queue.put(dets, block=False)  # 외부 호출 없으면 FULL 발생 여지 없음
             except Full:
                 pass # 사실 없어도 되는데 안전장치
-
+            self.flg_count += 1 # 바운딩 박스 갱신 플래그
 
     def _display_loop(self) -> None:
         """
         고해상도 프레임과 저해상도 프레임을 각기 다른 창에 표시하는 스레드
+        모델 추론이 완료될 때만 바운딩 박스 갱신, 추론 중일때는 이전 바운딩 박스 유지
         :return: None
         """
-        start_time = time()
         win_hi = "High-Res"
         win_lo = "Low-Res"
         cv2.namedWindow(win_hi, cv2.WINDOW_AUTOSIZE)
         cv2.namedWindow(win_lo, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_lo, 640, 640) #640x640으로 크기 조정
-
+        
+        temp_count = 0
+        disp_time = time.perf_counter()
         while not self.stop_event.is_set():
-            # Retrieve most recent detection results
-            try:
-                dets = self.det_queue.get(timeout=self.delay)
-            except Empty:
-                dets = None
-
             # Show low-res preview for debugging
             try:
-                lo, hi = self.frame_queue.get(timeout=0.005)
-                lo_bgr = cv2.cvtColor(lo, cv2.COLOR_YUV2BGR_I420)
-                cv2.imshow(win_lo, lo_bgr)
+                lo, hi = self.frame_queue.get(timeout=self.delay)
+                # Empty 발생 시 아래는 실행되지 않음
+                cv2.imshow(win_lo, lo)
+                disp_end_time = time.perf_counter()
+                self._disp_time.append(disp_end_time - disp_time)
+                disp_time = disp_end_time
             except Empty:
                 pass
+
+            # flag가 변경되었을 때만 바운딩 박스 갱신
+            if self.flg_count != temp_count:
+                temp_count = self.flg_count
+                try:
+                    dets = self.det_queue.get_nowait()
+                except Empty:
+                    dets = None # 감지된 객체가 없을 경우 None으로 설정
 
             # Draw bounding boxes
             if dets is not None and len(dets) > 0:
@@ -133,13 +151,14 @@ class CameraProcessor:
                     cv2.imshow(win_hi, patches[0])
             else:
                 cv2.imshow(win_hi, self.blank)  # 빈 프레임 표시
-                #cv2.destroyWindow(win_hi)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
+                print("Stopping camera processor...")
+                print(f"Average Inference Time: {np.mean(self._inf_time):.4f} seconds")
+                print(f"Average FPS: {1/(np.mean(self._disp_time)):.4f} fps")
+                cv2.destroyAllWindows()
                 break
-        fps = 1 / (time() - start_time)
-        print(f"FPS: {fps:.2f}")
 
 
     def run(self):
@@ -157,7 +176,7 @@ class CameraProcessor:
 if __name__ == "__main__":
     HIGH_RES = (1280, 1280)  # 고해상도 해상도
     LOW_RES = (192, 192)  # 저해상도 해상도
-    QUANT = True  # 양자화 여부
+    QUANT = False  # 양자화 여부
 
     # 환경변수 설정__ 필요하면 잡아주기
     # os.environ["OMP_NUM_THREADS"] = "4"  # Disable OpenMP threads for ONNX Runtime
