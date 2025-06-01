@@ -4,12 +4,17 @@ import numpy as np
 import threading
 import onnxruntime as ort
 import time
+import struct, socket
+import argparse
+
+from collections import deque
 from queue import Queue, Empty, Full
 from picamera2 import Picamera2
 from ultralytics import YOLO
+
+from config import SERVER_PORT, SERVER_IP
 import util
-from collections import deque
-import argparse
+
 
 class CameraProcessor:
     def __init__(
@@ -20,6 +25,11 @@ class CameraProcessor:
             high_res: tuple = (1280, 1280),
             low_res: tuple = (192, 192),
             max_queue_size: int = 1,
+            target_ip: str = "0.0.0.0",
+            port_lo: int = 5000,
+            port_hi: int = 5001,
+            port_lat_send: int = 5002,
+            port_lat_recv: int = 5003
             ):
         self.model = model
         self.mode = mode
@@ -38,6 +48,7 @@ class CameraProcessor:
         else:
             raise ValueError("Invalid mode. Choose 'picam' or 'webcam'.")
 
+        # display 및 detect 관련 변수
         self.flg_count = 0
 
         self.high_res = high_res
@@ -47,13 +58,41 @@ class CameraProcessor:
         self.stop_event = threading.Event()
 
         self._inf_time = deque(maxlen=500)  # 최근 500개 프레임의 추론 시간 기록
-        self._disp_time = deque(maxlen=500)  # 최근 500개 프레임의 디스플레이 시간 기록
         self.fps = 20  # 최저 FPS 설정
         self.delay = 1/self.fps # 0.05초 대기
         self.sx = high_res[0] / low_res[0] # 저해상도에서 고해상도로 변환할 때 x축 비율
         self.sy = high_res[1] / low_res[1] # 저해상도에서 고해상도로 변환할 때 y축 비율
 
         self.blank = np.zeros((100, 100, 3), dtype=np.uint8)  # 빈 프레임
+
+        # 네트워크 관련 변수
+        self.target_ip = target_ip
+        self.port_lo = port_lo
+        self.port_hi = port_hi
+        self.port_lat_send = port_lat_send
+        self.port_lat_recv = port_lat_recv
+
+        # 소켓 설정
+        self.sock_lo = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock_lo.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock_lo.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock_lo.connect((self.target_ip, self.port_lo))
+        
+        self.sock_hi = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock_hi.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock_hi.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock_hi.connect((self.target_ip, self.port_hi))
+        
+        self.sock_lat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_lat.settimeout(1.0)  # 최대 1초 대기
+        self.sock_lat.bind(("0.0.0.0", self.port_lat_recv))  # 로컬 포트 바인딩
+
+        # 통계 변수
+        self.frame_count_lo = 0
+        self.frame_count_hi = 0
+        self.byte_count_lo = 0
+        self.byte_count_hi = 0
+        self.latency_list = deque(maxlen=500)  # 최근 500개 프레임의 지연 시간 기록
 
 
     def _capture_loop(self) -> None:
@@ -127,33 +166,29 @@ class CameraProcessor:
                 self.stop_event.set()
                 raise RuntimeError("Flag count exceeded 1000, possible infinite loop detected.")
 
+
     def _display_loop(self) -> None:
         """
         고해상도 프레임과 저해상도 프레임을 각기 다른 창에 표시하는 스레드
         모델 추론이 완료될 때만 바운딩 박스 갱신, 추론 중일때는 이전 바운딩 박스 유지
         :return: None
         """
-        win_hi = "High-Res"
-        win_lo = "Low-Res"
-        cv2.namedWindow(win_hi, cv2.WINDOW_AUTOSIZE)
-        cv2.namedWindow(win_lo, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win_lo, 640, 640) #640x640으로 크기 조정
-        
         temp_count = 0
         dets = None  # 초기값 설정
-        disp_time = time.perf_counter()
         renew_time = time.perf_counter()
+        cv2.namedWindow("for quit", cv2.WINDOW_NORMAL)
+        cv2.imshow("for quit", self.blank)  # 종료를 위한 빈 창 생성
+
         while not self.stop_event.is_set():
-            # Show low-res preview for debugging
             try:
                 lo, hi = self.frame_queue.get(timeout=self.delay)
-                # Empty 발생 시 아래는 실행되지 않음
-                cv2.imshow(win_lo, lo)
-                disp_end_time = time.perf_counter()
-                self._disp_time.append(disp_end_time - disp_time)
-                disp_time = disp_end_time
             except Empty:
                 pass
+
+            data_lo = util.encode_jpeg(lo, quality=ENCODE_JPEG_QUALITY)
+            self.sock_lo.sendall(len(data_lo).to_bytes(4, 'big') + data_lo)
+            self.frame_count_lo += 1
+            self.byte_count_lo += len(data_lo) + 4  # 헤더 크기 포함
 
             # flag가 변경되었을 때만 바운딩 박스 갱신
             if self.flg_count != temp_count:
@@ -171,33 +206,18 @@ class CameraProcessor:
             if dets is not None and len(dets) > 0:
                 dets_to_show = dets[:2] if len(dets) > 2 else dets
                 dets_to_show = sorted(dets_to_show, key=lambda x: x[0]) # detection 값이 sort되어야 안정적으로 ROI 출력 가능
-                patches = []
-                for box in dets_to_show:
-                    x1, y1, x2, y2 = map(int, box[:4])
-                    hr1, hr2 = int(x1*self.sx*0.95), int(y1*self.sy*0.90)
-                    hr3, hr4 = int(x2*self.sx*1.05), int(y2*self.sy)
-                    hr1, hr2 = max(0, hr1), max(0, hr2)
-                    hr3, hr4 = min(self.high_res[0], hr3), min(self.high_res[1], hr4)
-                    roi = hi[hr2:hr4, hr1:hr3]
-                    if roi.size:
-                        patches.append(roi)
-                if len(patches) > 1:
-                    h1, w1 = patches[0].shape[:2]
-                    h2, w2 = patches[1].shape[:2]
-                    canvas = np.zeros((max(h1, h2), w1 + w2, 3), dtype=patches[0].dtype)
-                    canvas[:h1, :w1] = patches[0]
-                    canvas[:h2, w1:w1+w2] = patches[1]
-                    cv2.imshow(win_hi, canvas)
-                elif len(patches) == 1:
-                    cv2.imshow(win_hi, patches[0])
-                else:
-                    cv2.imshow(win_hi, self.blank)
+                patches = util.extract_rois(hi, dets_to_show, self.sx, self.sy)  # util.extract_rois 사용
+                canvas = util.compose_canvas(patches)  # util.compose_canvas 사용
             else:
-                cv2.imshow(win_hi, self.blank)  # 빈 프레임 표시
+                canvas = self.blank
+
+            data_hi = util.encode_jpeg(canvas, quality=ENCODE_JPEG_QUALITY)
+            self.sock_hi.sendall(len(data_hi).to_bytes(4, 'big') + data_hi)
+            self.frame_count_hi += 1
+            self.byte_count_hi += len(data_hi) + 4  # 헤더 크기 포함
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
-                print("Stopping camera processor...")
                 print(f"Average Inference Time: {np.median(self._inf_time):.4f} seconds")
                 data = np.array(self._inf_time)
                 q1 = np.percentile(data, 25)
@@ -205,16 +225,66 @@ class CameraProcessor:
                 p95 = np.percentile(data, 95)
                 iqr = q3 - q1
                 print(f"IQR: {iqr:.4f}, Q1: {q1:.4f}, Q3: {q3:.4f}, P95: {p95:.4f} seconds")
-                print(f"Average FPS: {1/(np.mean(self._disp_time)):.4f} fps")
-                cv2.destroyAllWindows()
                 break
+
+
+    def _status_loop(self):
+        """
+        네트워크 상태를 모니터링하는 스레드
+        :return: None
+        """
+        while not self.stop_event.is_set():
+            start_time = time.perf_counter()
+            time.sleep(1.0)  # 1초마다 상태 확인
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+        
+            # fps 계산
+            fps_lo = self.frame_count_lo / elapsed_time
+            fps_hi = self.frame_count_hi / elapsed_time
+
+            # bitrate 계산 (mbps)
+            bitrate_lo = (self.byte_count_lo * 8) / (elapsed_time * 1e6) 
+            bitrate_hi = (self.byte_count_hi * 8) / (elapsed_time * 1e6)
+
+            # latency 계산 (ms)
+            if self.latency_list:
+                latency_avg = np.mean(self.latency_list) * 1000
+            else:
+                latency_avg = 0.0
+
+            print(f"Status Update: "
+                  f"[Low]: {fps_lo:.2f} fps | {bitrate_lo:.2f} Mbps || "
+                  f"[High]: {fps_hi:.2f} fps | {bitrate_hi:.2f} Mbps || "
+                  f"Avg Latency: {latency_avg:.2f} ms")
+            
+            self.frame_count_lo = 0
+            self.frame_count_hi = 0
+            self.byte_count_lo = 0
+            self.byte_count_hi = 0
+            self.latency_list.clear()  # 상태 업데이트 후 지연 시간 기록 초기화
+
+            # 소켓을 통해 지연 시간 측정
+            try:
+                send_ts = time.perf_counter()
+                payload = struct.pack('d', send_ts)  # 타임스탬프를 바이너리로 변환
+                self.sock_lat.sendto(payload, (self.target_ip, self.port_lat_send))
+                data_echo, _ = self.sock_lat.recvfrom(1024)  # 최대 1024바이트 수신
+                recv_ts = time.perf_counter()
+
+                (orig_send_ts, ) = struct.unpack('d', data_echo[:8])  # 처음 8바이트를 타임스탬프로 변환
+                rtt = recv_ts - orig_send_ts  
+                self.latency_list.append(rtt)
+            except (socket.timeout, struct.error) as e:
+                pass
 
 
     def run(self):
         threads = [
             threading.Thread(target=self._capture_loop, daemon=True),
             threading.Thread(target=self._detect_loop, daemon=True),
-            threading.Thread(target=self._display_loop)
+            threading.Thread(target=self._display_loop),
+            threading.Thread(target=self._status_loop, daemon=True)
         ]
         for t in threads:
             t.start()
@@ -233,6 +303,8 @@ if __name__ == "__main__":
     args.high = tuple(args.high)
     args.low = tuple(args.low)
     QUANT = args.quant
+
+    ENCODE_JPEG_QUALITY = 90  # JPEG 인코딩 품질 설정
 
     print("now here")
     # 환경변수 설정__ 필요하면 잡아주기
@@ -256,7 +328,13 @@ if __name__ == "__main__":
         mode=args.type,
         high_res=args.high, 
         low_res=args.low, 
-        classes=[0])
+        classes=[0],
+        target_ip=SERVER_IP,
+        port_lo=SERVER_PORT,
+        port_hi=SERVER_PORT + 1,
+        port_lat_send=SERVER_PORT + 2,
+        port_lat_recv=SERVER_PORT + 3
+        )
     try:
         camera_processor.run()
     except KeyboardInterrupt:

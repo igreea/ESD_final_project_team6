@@ -2,12 +2,11 @@
 
 # 네트워크
 SERVER_HOST      = '0.0.0.0'         # 수신측 바인딩 호스트
-SERVER_PORT      = 9000              # 수신측 포트
-DEFAULT_SERVER_IP= '192.168.0.50'    # 송신측 기본 PC IP
+SERVER_PORT      = 5000              # 수신측 포트
+CLIENT_IP        = '192.168.10.1'    # 송신측(client) PC IP
+SERVER_IP        = '192.168.10.2'    # 수신측(server) PC IP
 IFACE            = 'eth0'            # 측정 인터페이스 이름
 
-# JPEG 인코딩
-JPEG_QUALITY     = 85                # imencode 품질 (0-100)
 BUFFER_SIZE      = 64 * 1024         # 소켓 읽기/쓰기 버퍼 크기
 
 # 큐, 반복

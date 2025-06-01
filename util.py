@@ -58,7 +58,10 @@ def extract_rois(image: np.ndarray, boxes: np.ndarray, sx: float, sy: float) -> 
     for box in boxes:
         x1, y1, x2, y2 = map(int, box[:4]*[sx, sy, sx, sy])
         # Ensure coordinates are within image bounds
-        patches.append(image[y1:y2, x1:x2].copy())
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
+        if x1 < x2 and y1 < y2:  # Valid box
+            patches.append(image[y1:y2, x1:x2].copy())
     return patches
 
 
