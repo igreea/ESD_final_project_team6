@@ -38,7 +38,7 @@ class CameraProcessor:
         if self.mode == "picam":
             self.picam2 = Picamera2()
             self.cfg = self.picam2.create_preview_configuration(
-                main={"size": high_res, "format": "BGR888"}
+                main={"size": high_res, "format": "RGB888"}
             )
             self.picam2.configure(self.cfg)
         elif self.mode == "webcam":
@@ -100,6 +100,7 @@ class CameraProcessor:
         picamera2에서 프레임을 캡처하여 lo_queue와 hi_queue에 저장하는 스레드
         :return: None
         """
+        print("start capture")
         if self.mode == "picam":
             self.picam2.start()
             while not self.stop_event.is_set():
@@ -143,12 +144,13 @@ class CameraProcessor:
         최악의 경우 timeout 지연 5ms 발생 가능
         :return: None
         """
+        print("start detect")
         while not self.stop_event.is_set():
             try:
-                bgr, _ = self.frame_queue.get(timeout=0.005)
+                rgb, _ = self.frame_queue.get(timeout=0.005)
             except Empty:
                 continue
-            rgb = bgr[..., ::-1]  # BGR to RGB view
+            #rgb = bgr[..., ::-1]  # BGR to RGB view
             results = self.model(rgb, imgsz=self.low_res, verbose=False)
 
             dets = results[0].boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
@@ -173,6 +175,7 @@ class CameraProcessor:
         모델 추론이 완료될 때만 바운딩 박스 갱신, 추론 중일때는 이전 바운딩 박스 유지
         :return: None
         """
+        print("start display")
         temp_count = 0
         dets = None  # 초기값 설정
         renew_time = time.perf_counter()
@@ -182,13 +185,14 @@ class CameraProcessor:
         while not self.stop_event.is_set():
             try:
                 lo, hi = self.frame_queue.get(timeout=self.delay)
+                data_lo = util.encode_jpeg(lo, quality=ENCODE_JPEG_QUALITY)
+                self.sock_lo.sendall(len(data_lo).to_bytes(4, 'big') + data_lo)
+                self.frame_count_lo += 1
+                self.byte_count_lo += len(data_lo) + 4  # 헤더 크기 포함
             except Empty:
-                pass
+                continue
 
-            data_lo = util.encode_jpeg(lo, quality=ENCODE_JPEG_QUALITY)
-            self.sock_lo.sendall(len(data_lo).to_bytes(4, 'big') + data_lo)
-            self.frame_count_lo += 1
-            self.byte_count_lo += len(data_lo) + 4  # 헤더 크기 포함
+
 
             # flag가 변경되었을 때만 바운딩 박스 갱신
             if self.flg_count != temp_count:
@@ -218,7 +222,7 @@ class CameraProcessor:
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
-                print(f"Average Inference Time: {np.median(self._inf_time):.4f} seconds")
+                print(f"Median Inference Time: {np.median(self._inf_time):.4f} seconds")
                 data = np.array(self._inf_time)
                 q1 = np.percentile(data, 25)
                 q3 = np.percentile(data, 75)
@@ -233,6 +237,7 @@ class CameraProcessor:
         네트워크 상태를 모니터링하는 스레드
         :return: None
         """
+        print("start status")
         while not self.stop_event.is_set():
             start_time = time.perf_counter()
             time.sleep(1.0)  # 1초마다 상태 확인
@@ -295,7 +300,7 @@ class CameraProcessor:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--type", choices=["webcam", "picam"], default="picam", help="Camera type to use")
-    parser.add_argument('--high', nargs=2, type=int, default=(1920,1920), help='High-res WxH')
+    parser.add_argument('--high', nargs=2, type=int, default=(1280,1280), help='High-res WxH')
     parser.add_argument('--low', nargs=2, type=int, default=(192,192), help='Low-res WxH')
     parser.add_argument('--quant', action='store_true', help='Use quantized ONNX model')
     args = parser.parse_args()
