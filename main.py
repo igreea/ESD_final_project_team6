@@ -152,8 +152,9 @@ class CameraProcessor:
                 continue
             #rgb = bgr[..., ::-1]  # BGR to RGB view
             results = self.model(rgb, imgsz=self.low_res, verbose=False)
-
+            
             dets = results[0].boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
+            #dets = None
             try:
                 self.det_queue.get_nowait()
             except Empty:
@@ -223,6 +224,9 @@ class CameraProcessor:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
                 print(f"Median Inference Time: {np.median(self._inf_time):.4f} seconds")
+                inflist = [round(x,2) for x in self._inf_time]
+                print(inflist)
+                print(f"sorted: {inflist.sort()}\n")
                 data = np.array(self._inf_time)
                 q1 = np.percentile(data, 25)
                 q3 = np.percentile(data, 75)
@@ -237,24 +241,36 @@ class CameraProcessor:
         네트워크 상태를 모니터링하는 스레드
         :return: None
         """
+        fps_lo_list = deque(maxlen=500)
+        fps_hi_list = deque(maxlen=500)
+        bit_lo_list = deque(maxlen=500)
+        bit_hi_list = deque(maxlen=500)
+        lat_list = deque(maxlen=500)
         print("start status")
         while not self.stop_event.is_set():
             start_time = time.perf_counter()
-            time.sleep(1.0)  # 1초마다 상태 확인
+            time.sleep(0.5)  # 1초마다 상태 확인
             end_time = time.perf_counter()
             elapsed_time = end_time - start_time
         
             # fps 계산
             fps_lo = self.frame_count_lo / elapsed_time
             fps_hi = self.frame_count_hi / elapsed_time
+            fps_lo_list.append(fps_lo)
+            fps_hi_list.append(fps_hi)
+            print(len(fps_lo_list))
+
 
             # bitrate 계산 (mbps)
             bitrate_lo = (self.byte_count_lo * 8) / (elapsed_time * 1e6) 
             bitrate_hi = (self.byte_count_hi * 8) / (elapsed_time * 1e6)
-
+            bit_lo_list.append(bitrate_lo)
+            bit_hi_list.append(bitrate_hi)
+                
             # latency 계산 (ms)
             if self.latency_list:
                 latency_avg = np.mean(self.latency_list) * 1000
+                lat_list.append(latency_avg)
             else:
                 latency_avg = 0.0
 
@@ -282,7 +298,16 @@ class CameraProcessor:
                 self.latency_list.append(rtt)
             except (socket.timeout, struct.error) as e:
                 pass
-
+        print(f"Last Status Update: "
+              f"[Low avg]: {np.mean(fps_lo_list):.2f} fps | {np.mean(bit_lo_list):.2f} Mbps || "
+              f"[High avg]: {np.mean(fps_hi_list):.2f} fps | {np.mean(bit_hi_list):.2f} Mbps || "
+              f"[Latency avg]: {np.mean(lat_list):.2f} || "
+              f"len: {len(fps_lo_list)}")   
+        print(f"fps_lo_list: {fps_lo_list}")
+        print(f"fps_hi_list: {fps_hi_list}")
+        print(f"bit_lo_list: {bit_lo_list}")
+        print(f"bit_hi_list: {bit_hi_list}")
+        
 
     def run(self):
         threads = [
@@ -301,7 +326,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--type", choices=["webcam", "picam"], default="picam", help="Camera type to use")
     parser.add_argument('--high', nargs=2, type=int, default=(1280,1280), help='High-res WxH')
-    parser.add_argument('--low', nargs=2, type=int, default=(192,192), help='Low-res WxH')
+    parser.add_argument('--low', nargs=2, type=int, default=(224,224), help='Low-res WxH')
     parser.add_argument('--quant', action='store_true', help='Use quantized ONNX model')
     args = parser.parse_args()
 
