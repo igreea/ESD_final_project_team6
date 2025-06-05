@@ -7,6 +7,7 @@ import time
 from queue import Queue, Full, Empty
 
 from config import SERVER_HOST, SERVER_PORT, STATS_INTERVAL, BUFFER_SIZE
+import util
 
 # 수신 IP/포트 (sender 쪽 --target_ip로 지정된 값)
 PORT_LO = SERVER_PORT          # 저해상도 프레임 수신 포트
@@ -38,6 +39,8 @@ sock_lat.setblocking(False)  # 논블로킹 모드로 설정
 # 큐 생성
 send_queue_lo = Queue(maxsize=5)  # 저해상도 프레임 전송용 큐
 send_queue_hi = Queue(maxsize=5)  # 고해상도 프레임 전송용 큐
+save_queue_lo = Queue(maxsize=5)  # 저해상도 프레임 저장용 큐
+save_queue_hi = Queue(maxsize=5)  # 고해상도 프레임 저장용 큐
 
 stop_event = threading.Event()
 
@@ -150,6 +153,7 @@ def _display_frames():# OpenCV 윈도우 생성
             frame_lo = send_queue_lo.get(timeout=0.02)
             #cv2.cvtColor(frame_lo, cv2.COLOR_RGB2BGR, frame_lo)  # OpenCV는 BGR을 사용하므로 변환
             cv2.imshow("Received LO", frame_lo)
+            save_queue_lo.put(frame_lo, block=True)  # 논블로킹으로 큐에 프레임 추가
         except Empty:
             pass
         
@@ -157,6 +161,7 @@ def _display_frames():# OpenCV 윈도우 생성
             frame_hi = send_queue_hi.get(timeout=0.02)
             #cv2.cvtColor(frame_hi, cv2.COLOR_RGB2BGR, frame_hi)  # OpenCV는 BGR을 사용하므로 변환
             cv2.imshow("Received HI", frame_hi)
+            save_queue_hi.put(frame_hi, block=True)  # 논블로킹으로 큐에 프레임 추가
         except Empty:
             pass
 
@@ -165,12 +170,73 @@ def _display_frames():# OpenCV 윈도우 생성
             cv2.destroyAllWindows()
             break
 
+def _save_frames_to_video():
+    """
+    frame_lo와 frame_hi를 각각 video_lo.mp4, video_hi.mp4로 저장하는 함수.
+    """
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_lo = None
+    out_hi = None
+    fps = 15  # 필요시 조정
+    target_size = (1280, 1280)  # 필요시 조정
+    hi_saving = False
+    hi_blank_start = None  # blank 상태 시작 시간
+    while not stop_event.is_set():
+        try:
+            frame_lo = save_queue_lo.get(timeout=0.02)
+            if out_lo is None:
+                h, w = frame_lo.shape[:2]
+                out_lo = cv2.VideoWriter('video_lo.mp4', fourcc, fps, (w, h))
+            out_lo.write(frame_lo)
+        except Empty:
+            pass
+
+        try:
+            frame_hi = save_queue_hi.get(timeout=0.02)
+            frame_hi_fixed = util._resize_and_pad(frame_hi, target_size=target_size)
+            is_blank = util._is_blank(frame_hi)
+
+            now = time.time()
+            if is_blank:
+                if hi_saving:
+                    if hi_blank_start is None:
+                        hi_blank_start = now
+                    elif now - hi_blank_start >= 2.0:
+                        # 2초 이상 blank → 저장 중지
+                        hi_saving = False
+                        hi_blank_start = None
+                        if out_hi is not None:
+                            out_hi.release()
+                            out_hi = None
+                        print("[HI] 2초 이상 blank 감지, 저장 중지")
+                continue  # blank면 저장하지 않음
+            else:
+                hi_blank_start = None
+                if not hi_saving:
+                    # 정상 프레임이 처음 들어오면 새 파일로 저장 시작
+                    out_hi = cv2.VideoWriter(util._get_now_filename('video_hi'), fourcc, fps, target_size)
+                    hi_saving = True
+                    print("[HI] 정상 프레임 감지, 저장 시작")
+                if out_hi is not None:
+                    out_hi.write(frame_hi_fixed)
+        except Empty:
+            pass
+
+        if stop_event.is_set():
+            break
+
+    if out_lo is not None:
+        out_lo.release()
+    if out_hi is not None:
+        out_hi.release()
+
 try:
     threads = [
         threading.Thread(target=_lo_recv, args=(conn_lo,), daemon=True),
         threading.Thread(target=_hi_recv, args=(conn_hi,), daemon=True),
         threading.Thread(target=_latency_echo, args=(sock_lat,), daemon=True),
-        threading.Thread(target=_display_frames)
+        threading.Thread(target=_display_frames),
+        threading.Thread(target=_save_frames_to_video, daemon=True)  # 비디오 저장 쓰레드 추가
     ]
     for t in threads:
         t.start()

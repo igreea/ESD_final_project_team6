@@ -2,6 +2,7 @@ from ultralytics import YOLO
 from onnxruntime.quantization import shape_inference, quantize_dynamic, QuantType
 import cv2
 import numpy as np
+import datetime
 
 def load_onnx_model(model_path:str, res:tuple = (640, 640)) -> YOLO:
     """
@@ -116,3 +117,42 @@ def decode_jpeg(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     return img if img is not None else np.zeros((1, 1, 3), dtype=np.uint8)
+
+def _resize_and_pad(frame, target_size=(1280, 1280)):
+    """
+    frame을 target_size에 맞게 패딩 또는 슬라이싱하여 반환.
+    """
+    th, tw = target_size
+    h, w = frame.shape[:2]
+
+    # 크기가 크면 슬라이싱
+    if h > th:
+        frame = frame[:th, :]
+    if w > tw:
+        frame = frame[:, :tw]
+
+    h, w = frame.shape[:2]
+    pad_bottom = th - h if h < th else 0
+    pad_right = tw - w if w < tw else 0
+
+    if pad_bottom > 0 or pad_right > 0:
+        frame = cv2.copyMakeBorder(frame, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=(0,0,0))
+    return frame
+
+def _is_blank(frame, threshold=10):
+    """
+    frame이 거의 검은 화면(100x100, 값이 거의 0)인지 확인.
+    """
+    if frame is None:
+        return True
+    h, w = frame.shape[:2]
+    if h == 100 and w == 100 and np.mean(frame) < threshold:
+        return True
+    return False
+
+def _get_now_filename(prefix):
+    """
+    현재 시간을 포함한 파일명 생성
+    """
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{now}.mp4"
