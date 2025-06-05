@@ -4,7 +4,7 @@ import numpy as np
 import struct
 import threading
 import time
-from queue import Queue
+from queue import Queue, Full, Empty
 
 from config import SERVER_HOST, SERVER_PORT, STATS_INTERVAL, BUFFER_SIZE
 
@@ -33,9 +33,7 @@ sock_lat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock_lat.bind((SERVER_HOST, PORT_LAT_SEND))
 sock_lat.setblocking(False)  # 논블로킹 모드로 설정
 
-# OpenCV 윈도우 생성
-cv2.namedWindow("Received LO", cv2.WINDOW_NORMAL)
-cv2.namedWindow("Received HI", cv2.WINDOW_NORMAL)
+
 
 # 큐 생성
 send_queue_lo = Queue(maxsize=5)  # 저해상도 프레임 전송용 큐
@@ -85,7 +83,7 @@ def _lo_recv(conn: socket.socket):
             last_stats_lo = now_lo
         try:
             send_queue_lo.put(frame_lo, block=False)  # 논블로킹으로 큐에 프레임 추가
-        except Queue.Full:
+        except Full:
             _ = send_queue_lo.get()  # 큐가 가득 찼을 때 가장 오래된 프레임 제거
             send_queue_lo.put(frame_lo, block=False)  # 새 프레임 추가
 
@@ -132,7 +130,7 @@ def _hi_recv(conn: socket.socket):
         
         try:
             send_queue_hi.put(frame_hi, block=False)  # 논블로킹으로 큐에 프레임 추가
-        except Queue.Full:
+        except Full:
             _ = send_queue_hi.get()
             send_queue_hi.put(frame_hi, block=False)  # 새 프레임 추가
 
@@ -144,18 +142,22 @@ def _latency_echo(sock: socket.socket):
         except BlockingIOError:
             pass
 
-def _display_frames():
+def _display_frames():# OpenCV 윈도우 생성
+    cv2.namedWindow("Received LO", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Received HI", cv2.WINDOW_NORMAL)
     while not stop_event.is_set():
         try:
             frame_lo = send_queue_lo.get(timeout=0.02)
+            #cv2.cvtColor(frame_lo, cv2.COLOR_RGB2BGR, frame_lo)  # OpenCV는 BGR을 사용하므로 변환
             cv2.imshow("Received LO", frame_lo)
-        except Queue.Empty:
+        except Empty:
             pass
         
         try:
             frame_hi = send_queue_hi.get(timeout=0.02)
+            #cv2.cvtColor(frame_hi, cv2.COLOR_RGB2BGR, frame_hi)  # OpenCV는 BGR을 사용하므로 변환
             cv2.imshow("Received HI", frame_hi)
-        except Queue.Empty:
+        except Empty:
             pass
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -163,16 +165,20 @@ def _display_frames():
             cv2.destroyAllWindows()
             break
 
-threads = [
-    threading.Thread(target=_lo_recv, args=(conn_lo,), daemon=True),
-    threading.Thread(target=_hi_recv, args=(conn_hi,), daemon=True),
-    threading.Thread(target=_latency_echo, args=(sock_lat,), daemon=True),
-    threading.Thread(target=_display_frames)
-]
-for t in threads:
-    t.start()
-for t in threads:
-    t.join()
+try:
+    threads = [
+        threading.Thread(target=_lo_recv, args=(conn_lo,), daemon=True),
+        threading.Thread(target=_hi_recv, args=(conn_hi,), daemon=True),
+        threading.Thread(target=_latency_echo, args=(sock_lat,), daemon=True),
+        threading.Thread(target=_display_frames)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+except KeyboardInterrupt:
+    stop_event.set()
+    pass
 
 cv2.destroyAllWindows()
 sock_lo.close()
