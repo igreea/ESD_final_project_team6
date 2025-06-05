@@ -10,6 +10,6 @@ IFACE            = 'eth0'            # 측정 인터페이스 이름
 BUFFER_SIZE      = 64 * 1024         # 소켓 읽기/쓰기 버퍼 크기
 
 # 큐, 반복
-MAX_QUEUE_SIZE   = 2                 # 전송용 큐 최대 크기
+MAX_QUEUE_SIZE   = 5                 # 전송용 큐 최대 크기
 STATS_INTERVAL   = 5.0               # 통계 출력 간격 (초)
 REPEATS          = 5                 # 파일 전송 벤치마크 반복 횟수

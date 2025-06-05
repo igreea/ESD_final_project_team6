@@ -328,6 +328,7 @@ if __name__ == "__main__":
     parser.add_argument('--high', nargs=2, type=int, default=(1280,1280), help='High-res WxH')
     parser.add_argument('--low', nargs=2, type=int, default=(224,224), help='Low-res WxH')
     parser.add_argument('--quant', action='store_true', help='Use quantized ONNX model')
+    parser.add_argument('--model', type=str, default="best", help='Path to the ONNX model file')
     args = parser.parse_args()
 
     args.high = tuple(args.high)
@@ -341,18 +342,19 @@ if __name__ == "__main__":
     # os.environ["OMP_NUM_THREADS"] = "4"  # Disable OpenMP threads for ONNX Runtime
     # os.environ["OPENBLAS_NUM_THREADS"] = "4"  # Disable OpenBLAS threads for ONNX Runtime
     # os.environ["TORCH_NUM_THREADS"] = "4"  # Disable PyTorch threads for ONNX Runtime
-
+    model_path = os.path.join("./models", args.model)
     try:
-        onnx_model = YOLO("best.onnx", task="detect")
+        onnx_model = YOLO((model_path + ".onnx"), task="detect")
     except:
-        onnx_model = util.load_onnx_model("best.pt", res=args.low)
+        onnx_model = util.load_onnx_model((model_path + ".pt"), res=args.low)
 
     if QUANT:
         try:
             onnx_model = YOLO("yolo11n_quant.onnx", task="detect")
         except:
             onnx_model = util.quant_onnx("yolo11n.onnx", "yolo11n_quant.onnx")
-    
+
+    raise ValueError("debug")
     camera_processor = CameraProcessor(
         model=onnx_model, 
         mode=args.type,
