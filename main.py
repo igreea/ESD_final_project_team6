@@ -11,6 +11,8 @@ from collections import deque
 from queue import Queue, Empty, Full
 from picamera2 import Picamera2
 from ultralytics import YOLO
+from onnx_fun import detection
+from libcamera import Transform
 
 from config import SERVER_PORT, SERVER_IP
 import util
@@ -20,6 +22,8 @@ class CameraProcessor:
     def __init__(
             self,
             model,
+            model_name,
+            sfactor,
             mode: str = "picam",
             classes: list = [0],
             high_res: tuple = (1280, 1280),
@@ -34,11 +38,13 @@ class CameraProcessor:
         self.model = model
         self.mode = mode
         self.model.classes = classes
+        self.model_name = model_name
 
         if self.mode == "picam":
             self.picam2 = Picamera2()
             self.cfg = self.picam2.create_preview_configuration(
-                main={"size": high_res, "format": "RGB888"}
+                main={"size": high_res, "format": "RGB888"},
+                transform=Transform(hflip=True, vflip=True)
             )
             self.picam2.configure(self.cfg)
         elif self.mode == "webcam":
@@ -60,8 +66,8 @@ class CameraProcessor:
         self._inf_time = deque(maxlen=500)  # 최근 500개 프레임의 추론 시간 기록
         self.fps = 20  # 최저 FPS 설정
         self.delay = 1/self.fps # 0.05초 대기
-        self.sx = high_res[0] / low_res[0] # 저해상도에서 고해상도로 변환할 때 x축 비율
-        self.sy = high_res[1] / low_res[1] # 저해상도에서 고해상도로 변환할 때 y축 비율
+        self.sx = (high_res[0] / low_res[0])*sfactor # 저해상도에서 고해상도로 변환할 때 x축 비율
+        self.sy = (high_res[1] / low_res[1])*sfactor # 저해상도에서 고해상도로 변환할 때 y축 비율
 
         self.blank = np.zeros((100, 100, 3), dtype=np.uint8)  # 빈 프레임
 
@@ -132,9 +138,9 @@ class CameraProcessor:
         else: # 잘못된 모드 처리
             raise ValueError("Invalid mode. Choose 'picam' or 'webcam'.")
     
-        if self.flg_count > 100:
-            print("flag count exceeded 100, cut the capture loop.")
-            self.stop_event.set()
+        #if self.flg_count > 100:
+         #   print("flag count exceeded 100, cut the capture loop.")
+          #  self.stop_event.set()
     
 
     def _detect_loop(self) -> None:
@@ -150,10 +156,12 @@ class CameraProcessor:
                 rgb, _ = self.frame_queue.get(timeout=0.005)
             except Empty:
                 continue
+            if self.model_name == "FastestDet_class1":
+                dets = np.array(detection(self.model, rgb, self.low_res[0], self.low_res[1], thresh=0.80))
+            else:
             #rgb = bgr[..., ::-1]  # BGR to RGB view
-            results = self.model(rgb, imgsz=self.low_res, verbose=False)
-
-            dets = results[0].boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
+                results = self.model(rgb, imgsz=self.low_res, verbose=False, conf=0.5)
+                dets = results[0].boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
             try:
                 self.det_queue.get_nowait()
             except Empty:
@@ -163,10 +171,7 @@ class CameraProcessor:
             except Full:
                 pass # 사실 없어도 되는데 안전장치
             self.flg_count += 1 # 바운딩 박스 갱신 플래그
-            if self.flg_count > 1000:
-                print("flag count exceeded 100, cut the detect loop.")
-                self.stop_event.set()
-                raise RuntimeError("Flag count exceeded 1000, possible infinite loop detected.")
+
 
 
     def _display_loop(self) -> None:
@@ -202,7 +207,7 @@ class CameraProcessor:
                 except Empty:
                     dets = None # 감지된 객체가 없을 경우 None으로 설정
                 renew_end_time = time.perf_counter()
-                self._inf_time.append(renew_end_time - renew_time)  # 추론 시간 기록
+                self._inf_time.append(renew_end_time - renew_time)  # 박스 갱신 시간 기록 
                 renew_time = renew_end_time
 
 
@@ -230,7 +235,11 @@ class CameraProcessor:
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
-                print(f"Median Inference Time: {np.median(self._inf_time):.4f} seconds")
+                print(f"Median Renew Time: {np.median(self._inf_time):.4f} seconds")
+                print(f"Mean Renew Time: {np.mean(self._inf_time):.4f} seconds")
+                inflist = [round(x,2) for x in self._inf_time]
+                print(inflist)
+                print(f"sorted: {inflist.sort()}\n")
                 data = np.array(self._inf_time)
                 q1 = np.percentile(data, 25)
                 q3 = np.percentile(data, 75)
@@ -245,24 +254,36 @@ class CameraProcessor:
         네트워크 상태를 모니터링하는 스레드
         :return: None
         """
+        fps_lo_list = deque(maxlen=500)
+        fps_hi_list = deque(maxlen=500)
+        bit_lo_list = deque(maxlen=500)
+        bit_hi_list = deque(maxlen=500)
+        lat_list = deque(maxlen=500)
         print("start status")
         while not self.stop_event.is_set():
             start_time = time.perf_counter()
-            time.sleep(1.0)  # 1초마다 상태 확인
+            time.sleep(0.5)  # 1초마다 상태 확인
             end_time = time.perf_counter()
             elapsed_time = end_time - start_time
         
             # fps 계산
             fps_lo = self.frame_count_lo / elapsed_time
             fps_hi = self.frame_count_hi / elapsed_time
+            fps_lo_list.append(fps_lo)
+            fps_hi_list.append(fps_hi)
+            print(len(fps_lo_list))
+
 
             # bitrate 계산 (mbps)
             bitrate_lo = (self.byte_count_lo * 8) / (elapsed_time * 1e6) 
             bitrate_hi = (self.byte_count_hi * 8) / (elapsed_time * 1e6)
-
+            bit_lo_list.append(bitrate_lo)
+            bit_hi_list.append(bitrate_hi)
+                
             # latency 계산 (ms)
             if self.latency_list:
                 latency_avg = np.mean(self.latency_list) * 1000
+                lat_list.append(latency_avg)
             else:
                 latency_avg = 0.0
 
@@ -290,7 +311,20 @@ class CameraProcessor:
                 self.latency_list.append(rtt)
             except (socket.timeout, struct.error) as e:
                 pass
-
+        print(f"Last Status Update: "
+              f"[Low avg]: {np.mean(fps_lo_list):.2f} fps | {np.mean(bit_lo_list):.2f} Mbps || "
+              f"[High avg]: {np.mean(fps_hi_list):.2f} fps | {np.mean(bit_hi_list):.2f} Mbps || "
+              f"[Latency avg]: {np.mean(lat_list):.2f} || "
+              f"len: {len(fps_lo_list)}")
+        fll = [round(x,2) for x in fps_lo_list]
+        fhl = [round(x,2) for x in fps_hi_list]
+        bll = [round(x,2) for x in bit_lo_list]
+        bhl = [round(x,2) for x in bit_hi_list]
+        print(f"fps_lo_list: {fll}")
+        print(f"fps_hi_list: {fhl}")
+        print(f"bit_lo_list: {bll}")
+        print(f"bit_hi_list: {bhl}")
+        
 
     def run(self):
         threads = [
@@ -304,14 +338,27 @@ class CameraProcessor:
         for t in threads:
             t.join()
     
+    def run_no_dec(self):
+        threads = [
+            threading.Thread(target=self._capture_loop, daemon=True),
+            threading.Thread(target=self._display_loop),
+            threading.Thread(target=self._status_loop, daemon=True)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--type", choices=["webcam", "picam"], default="picam", help="Camera type to use")
+    parser.add_argument("--mode", choices=["roi", "full"], default="roi", help="Select the mode: roi / full")
     parser.add_argument('--high', nargs=2, type=int, default=(1280,1280), help='High-res WxH')
-    parser.add_argument('--low', nargs=2, type=int, default=(192,192), help='Low-res WxH')
+    parser.add_argument('--low', nargs=2, type=int, default=(224,224), help='Low-res WxH')
     parser.add_argument('--quant', action='store_true', help='Use quantized ONNX model')
     parser.add_argument('--model', type=str, default="best", help='Path to the ONNX model file')
+    parser.add_argument('--scale', type=float, default=1.0, help="Bounding Box Scaling Factor (float)")
     args = parser.parse_args()
 
     args.high = tuple(args.high)
@@ -326,21 +373,28 @@ if __name__ == "__main__":
     # os.environ["OPENBLAS_NUM_THREADS"] = "4"  # Disable OpenBLAS threads for ONNX Runtime
     # os.environ["TORCH_NUM_THREADS"] = "4"  # Disable PyTorch threads for ONNX Runtime
     model_path = os.path.join("./models", args.model)
-    try:
-        onnx_model = YOLO((model_path + ".onnx"), task="detect")
-    except:
-        onnx_model = util.load_onnx_model((model_path + ".pt"), res=args.low)
-
-    if QUANT:
+    
+    
+    if (args.model == "FastestDet_class1"):
+        onnx_model = ort.InferenceSession(model_path+".onnx")
+    else:
+            
         try:
-            onnx_model = YOLO("yolo11n_quant.onnx", task="detect")
+            onnx_model = YOLO((model_path + ".onnx"), task="detect")
         except:
-            onnx_model = util.quant_onnx("yolo11n.onnx", "yolo11n_quant.onnx")
+            onnx_model = util.load_onnx_model((model_path + ".pt"), res=args.low)
 
-    raise ValueError("debug")
+        if QUANT:
+            try:
+                onnx_model = YOLO("yolo11n_quant.onnx", task="detect")
+            except:
+                onnx_model = util.quant_onnx("yolo11n.onnx", "yolo11n_quant.onnx")
+
     camera_processor = CameraProcessor(
         model=onnx_model, 
+        model_name = args.model,
         mode=args.type,
+        sfactor = args.scale,
         high_res=args.high, 
         low_res=args.low, 
         classes=[0],
@@ -351,7 +405,10 @@ if __name__ == "__main__":
         port_lat_recv=SERVER_PORT + 3
         )
     try:
-        camera_processor.run()
+        if (args.mode == "roi"):
+            camera_processor.run()
+        else:
+            camera_processor.run_no_dec()
     except KeyboardInterrupt:
         print(f"Interrupted by user. Stopping...")
         camera_processor.stop_event.set()
