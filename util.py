@@ -1,124 +1,158 @@
-from picamera2 import Picamera2
+from ultralytics import YOLO
+from onnxruntime.quantization import shape_inference, quantize_dynamic, QuantType
 import cv2
 import numpy as np
-import threading
-from queue import Queue, Empty
+import datetime
 
-# 해상도 설정
-HIGH_RES = (1280, 720)
-LOW_RES = (320, 180)
-LOW_RES_T = (LOW_RES[1], LOW_RES[0])
-
-# 전역 프레임 버퍼
-#high_res_frame = None
-#low_res_frame = None
-#detections = []
-hi_queue = Queue(maxsize=1)
-lo_queue = Queue(maxsize=1)
-det_queue = Queue(maxsize=1)
-
-stop_event = threading.Event()
-
-def picam2_init():
+def load_onnx_model(model_path:str, res:tuple = (640, 640)) -> YOLO:
     """
-    Picamera2 초기화 및 설정
-    high-resolution(main)과 low-resolution(lores) 두 이미지 동시 캡쳐 
-    :return: Picamera2 객체
+    Load the ONNX model using ONNX Runtime and return a YOLO wrapper.
+    :param model_path: Path to the ONNX model file.
+    :param res: Resolution for export (width, height).
+    :return: YOLO wrapper for the ONNX model.
     """
-    picam2 = Picamera2()
-    preview_config = picam2.create_preview_configuration(
-        main={"size": HIGH_RES, "format": "RGB888"},
-        lores={"size": LOW_RES}
-        )
-    picam2.configure(preview_config)
-    picam2.start()
-    return picam2
+    try:
+        model = YOLO(model_path)
+        model.export(format="onnx", nms=False, imgsz=res, dynamic=False, device="cpu")
+        onnx_name = model_path.rsplit(".", 1)[0] + ".onnx"
+        onnx_model = YOLO(onnx_name, task="detect")
+        print("ONNX model loaded/exported successfully.")
+        return onnx_model
+    except Exception as e:
+        print(f"Error loading ONNX model: {e}")
+        return None
+    
 
-def capture_thread(picam2):
+def quant_onnx(model_path:str, quant_model_path:str) -> YOLO:
     """
-    카메라에서 프레임을 캡처하여 원본 프레임은 hi_queue에,
-    저해상도 프레임은 lo_queue에 저장
-    :param picam2: Picamera2 객체
+    Quantize the ONNX model using ONNX Runtime.
+    :param model_path: Path to the ONNX model file.
+    :param quant_model_path: Path to save the quantized model.
+    :return: YOLO wrapper for the quantized model.
     """
-    global hi_queue, lo_queue, stop_event
-    while not stop_event.is_set():
-        hi = picam2.capture_array("main")
-        lo = picam2.capture_array("lores")
-        # 이전 프레임 버리기
-        if hi_queue.full():
-            hi_queue.get_nowait()
-        if lo_queue.full():
-            lo_queue.get_nowait()
-        hi_queue.put(hi)
-        lo_queue.put(lo)
+    pre_path = model_path.rsplit(".", 1)[0] + "_pre.onnx"
+    try:
+        shape_inference.quant_pre_process(model_path, pre_path)
+    except Exception as e:
+        print(f"Error during shape inference: {e}")
+        return None
+    try:
+        quantize_dynamic(pre_path, quant_model_path, weight_type=QuantType.QUInt8)
+        print("Model quantization successful.")
+        return YOLO(quant_model_path, task="detect")
+    except Exception as e:
+        print(f"Error during model quantization: {e}")
+        return None
 
-def detect_thread(model):
-    """
-    lo_queue에서 YOLO 모델을 사용하여 사람 감지
-    xyxy는 yolo에서 제공하는 attribute로, [x1, y1, x2, y2, conf, cls]를 포함
-    :param model: YOLO 모델 객체
-    """
-    global lo_queue, det_queue, stop_event
-    while not stop_event.is_set():
-        try:
-            frame = lo_queue.get(timeout=0.1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
-        except Empty:
-            continue
-        results = model(rgb, imgsz=LOW_RES_T, rect=True)[0]
-        dets = results.boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
-        if det_queue.full():
-            det_queue.get_nowait()
-        det_queue.put(dets)
 
-def display_thread(picam2):
+def extract_rois(image: np.ndarray, boxes: np.ndarray, sx: float, sy: float) -> list:
     """
-    고해상도 프레임과 저해상도 프레임을 각기 다른 창에 표시
-    :param picam2: Picamera2 객체
+    Extract ROI patches from an image using bounding boxes.
+    :param image: Full-resolution BGR image.
+    :param boxes: Nx4 array of [x1, y1, x2, y2] coordinates.
+    :param sx: Scale factor for x-axis.
+    :param sy: Scale factor for y-axis.
+    :return: List of cropped ROI images.
     """
-    global hi_queue, lo_queue, det_queue, stop_event
-    win_low = "Low-Res Stream"
-    win_roi = "High-Res ROI Detection"
-    #win_roi2 = "High-Res ROI Detection 2"
-    cv2.namedWindow(win_low, cv2.WINDOW_AUTOSIZE)
+    patches = []
+    boxes = sorted(boxes, key=lambda x: x[0])  # Sort by x1 coordinate
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box[:4]*[sx, sy, sx, sy])
+        # Ensure coordinates are within image bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
+        if x1 < x2 and y1 < y2:  # Valid box
+            patches.append(image[y1:y2, x1:x2].copy())
+    return patches
 
-    while not stop_event.is_set():
-        try:
-            hi = hi_queue.get(timeout=0.1)
-            lo = lo_queue.get()
-            dets = det_queue.get()
-        except Empty:
-            continue
-            
-        cv2.imshow(win_low, lo)
 
-        if len(dets):
-            dets_to_show = dets[:2] if len(dets) >= 3 else dets
-            patches = []
-            sx = HIGH_RES[0] / LOW_RES[0]
-            sy = HIGH_RES[1] / LOW_RES[1]
-            for x1, y1, x2, y2 in dets_to_show:   
-                x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-                hr1, hr2 = int(x1*sx), int(y1*sy)
-                hr3, hr4 = int(x2*sx), int(y2*sy)
-                roi = hi[hr2:hr4, hr1:hr3]
-                if roi.size:
-                    patches.append(roi)
-            if len(patches) > 1:
-                h1, w1 = patches[0].shape[:2]
-                h2, w2 = patches[1].shape[:2]
-                canvas = np.zeros((max(h1, h2), w1 + w2, 3), dtype=patches[0].dtype)
-                canvas[:h1, :w1] = patches[0]
-                canvas[:h2, w1:w1+w2] = patches[1]
-                cv2.imshow(win_roi, canvas)
-            else:
-                cv2.imshow(win_roi, patches[0])
-        else:
-            cv2.destroyWindow(win_roi)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            stop_event.set()
-            break
+def compose_canvas(patches: list, bg_size: tuple = None) -> np.ndarray:
+    """
+    Compose a display canvas from ROI patches.
+    If bg_size is provided, overlay patches onto a black background of given size.
+    Otherwise, concatenate patches horizontally.
+    :param patches: List of ROI images.
+    :param bg_size: Optional (height, width) of background canvas.
+    :return: Combined BGR image for display.
+    """
+    if not patches:
+        if bg_size:
+            return np.zeros((bg_size[0], bg_size[1], 3), dtype=np.uint8)
+        return np.zeros((100, 100, 3), dtype=np.uint8)
 
-    picam2.stop()
-    cv2.destroyAllWindows()
+    # If single patch, return it
+    if len(patches) == 1:
+        return patches[0] 
+
+    # Multiple patches: pad to same height then hstack
+    heights = [p.shape[0] for p in patches]
+    max_h = max(heights)
+    resized = []
+    for p in patches:
+        h, w = p.shape[:2]
+        if h < max_h:
+            pad = np.zeros((max_h - h, w, 3), dtype=p.dtype)
+            p = np.vstack((p, pad))
+        resized.append(p)
+    return np.hstack(resized)
+
+
+def encode_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
+    """
+    Encode a BGR image to JPEG bytes.
+    :param frame: HxWx3 BGR image.
+    :param quality: JPEG quality (0-100).
+    :return: Encoded JPEG byte string.
+    """
+    ret, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buf.tobytes() if ret else b''
+
+
+def decode_jpeg(data: bytes) -> np.ndarray:
+    """
+    Decode JPEG bytes to a BGR image.
+    :param data: JPEG byte string with length prefix removed.
+    :return: Decoded HxWx3 BGR image.
+    """
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img if img is not None else np.zeros((1, 1, 3), dtype=np.uint8)
+
+def _resize_and_pad(frame, target_size=(1280, 1280)):
+    """
+    frame을 target_size에 맞게 패딩 또는 슬라이싱하여 반환.
+    """
+    th, tw = target_size
+    h, w = frame.shape[:2]
+
+    # 크기가 크면 슬라이싱
+    if h > th:
+        frame = frame[:th, :]
+    if w > tw:
+        frame = frame[:, :tw]
+
+    h, w = frame.shape[:2]
+    pad_bottom = th - h if h < th else 0
+    pad_right = tw - w if w < tw else 0
+
+    if pad_bottom > 0 or pad_right > 0:
+        frame = cv2.copyMakeBorder(frame, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=(0,0,0))
+    return frame
+
+def _is_blank(frame, threshold=10):
+    """
+    frame이 거의 검은 화면(100x100, 값이 거의 0)인지 확인.
+    """
+    if frame is None:
+        return True
+    h, w = frame.shape[:2]
+    if h == 100 and w == 100 and np.mean(frame) < threshold:
+        return True
+    return False
+
+def _get_now_filename(prefix):
+    """
+    현재 시간을 포함한 파일명 생성
+    """
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{now}.mp4"
