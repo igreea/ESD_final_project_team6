@@ -13,7 +13,7 @@ High-Resolution ROI Capture by RaspberryPi4
 - **전체 프레임 스트리밍**: JPEG 인코딩한 전체 프레임을 TCP 전송.
 - **네트워크 제약 시뮬레이션**: Linux `tc` 명령어로 유선/무선 대역폭 제한 환경 구성.
 - **성능 로깅**: 각 단계(Capture, Detection, Encoding, Transmission, Decoding)별 FPS와 Bitrate(Mbps) 기록.
-= **서버 저장**: 서버로 전송된 영상을 mp4v 인코딩 후 타임태그와 함께 자동 저장.
+- **서버 저장**: 서버로 전송된 영상을 mp4v 인코딩 후 타임태그와 함께 자동 저장.
 
 
 ## 운용 branch 현황
